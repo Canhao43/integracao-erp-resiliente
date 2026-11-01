@@ -7,6 +7,7 @@ use Database\Factories\BeneficiarioFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 #[Fillable(['nome', 'cpf', 'data_nascimento', 'email', 'status_erp', 'codigo_erp', 'erro_erp', 'enviado_ao_erp_em'])]
 class Beneficiario extends Model
@@ -35,5 +36,13 @@ class Beneficiario extends Model
             'status_erp' => StatusErp::class,
             'enviado_ao_erp_em' => 'datetime',
         ];
+    }
+
+    /**
+     * @return HasMany<ChamadaErp, $this>
+     */
+    public function chamadasErp(): HasMany
+    {
+        return $this->hasMany(ChamadaErp::class);
     }
 }
