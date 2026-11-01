@@ -4,6 +4,9 @@ namespace Tests\Feature;
 
 use App\Models\Beneficiario;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use Illuminate\Testing\TestResponse;
 use Tests\TestCase;
 
 class CadastroDeBeneficiarioTest extends TestCase
@@ -24,11 +27,21 @@ class CadastroDeBeneficiarioTest extends TestCase
         ], $sobrescrever);
     }
 
+    /**
+     * Cada chamada é um pedido novo, com a sua própria Idempotency-Key.
+     *
+     * @param  array<string, mixed>  $dados
+     */
+    private function cadastrar(array $dados): TestResponse
+    {
+        return $this->postJson('/api/beneficiarios', $dados, ['Idempotency-Key' => (string) Str::uuid()]);
+    }
+
     public function test_cadastra_e_responde_201_com_location(): void
     {
         $dados = $this->payload();
 
-        $resposta = $this->postJson('/api/beneficiarios', $dados);
+        $resposta = $this->cadastrar($dados);
 
         $beneficiario = Beneficiario::sole();
         $resposta->assertCreated()
@@ -43,7 +56,7 @@ class CadastroDeBeneficiarioTest extends TestCase
     {
         $mascarado = fake('pt_BR')->cpf(true);
 
-        $this->postJson('/api/beneficiarios', $this->payload(['cpf' => $mascarado]))->assertCreated();
+        $this->cadastrar($this->payload(['cpf' => $mascarado]))->assertCreated();
 
         $this->assertDatabaseHas('beneficiarios', ['cpf' => preg_replace('/\D/', '', $mascarado)]);
     }
@@ -52,7 +65,7 @@ class CadastroDeBeneficiarioTest extends TestCase
     {
         $cpf = fake('pt_BR')->cpf(false);
 
-        $resposta = $this->postJson('/api/beneficiarios', $this->payload(['cpf' => $cpf]));
+        $resposta = $this->cadastrar($this->payload(['cpf' => $cpf]));
 
         $resposta->assertCreated()
             ->assertJsonPath('data.cpf', '***.'.substr($cpf, 3, 3).'.'.substr($cpf, 6, 3).'-**');
@@ -64,7 +77,7 @@ class CadastroDeBeneficiarioTest extends TestCase
         $cpf = fake('pt_BR')->cpf(false);
         $invalido = substr($cpf, 0, 10).(((int) $cpf[10] + 1) % 10);
 
-        $this->postJson('/api/beneficiarios', $this->payload(['cpf' => $invalido]))
+        $this->cadastrar($this->payload(['cpf' => $invalido]))
             ->assertUnprocessable()
             ->assertJsonValidationErrors(['cpf' => 'O CPF informado não é válido.']);
 
@@ -75,7 +88,29 @@ class CadastroDeBeneficiarioTest extends TestCase
     {
         $existente = Beneficiario::factory()->create();
 
-        $this->postJson('/api/beneficiarios', $this->payload(['cpf' => $existente->cpf]))
+        $this->cadastrar($this->payload(['cpf' => $existente->cpf]))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['cpf' => 'Já existe um beneficiário com este CPF.']);
+
+        $this->assertDatabaseCount('beneficiarios', 1);
+    }
+
+    public function test_cpf_gravado_por_outro_pedido_depois_da_validacao_responde_422_e_nao_500(): void
+    {
+        $dados = $this->payload();
+
+        // Simula a corrida: outro pedido grava o mesmo CPF entre a validação e o INSERT deste.
+        Beneficiario::creating(function () use ($dados) {
+            DB::table('beneficiarios')->insert([
+                'nome' => 'Outro pedido',
+                'cpf' => $dados['cpf'],
+                'data_nascimento' => '1980-01-01',
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        });
+
+        $this->cadastrar($dados)
             ->assertUnprocessable()
             ->assertJsonValidationErrors(['cpf' => 'Já existe um beneficiário com este CPF.']);
 
@@ -84,7 +119,7 @@ class CadastroDeBeneficiarioTest extends TestCase
 
     public function test_exige_os_campos_obrigatorios(): void
     {
-        $this->postJson('/api/beneficiarios', [])
+        $this->cadastrar([])
             ->assertUnprocessable()
             ->assertJsonValidationErrors(['nome', 'cpf', 'data_nascimento'])
             ->assertJsonMissingValidationErrors('email');
@@ -94,7 +129,7 @@ class CadastroDeBeneficiarioTest extends TestCase
     {
         $amanha = now()->addDay()->toDateString();
 
-        $this->postJson('/api/beneficiarios', $this->payload(['data_nascimento' => $amanha]))
+        $this->cadastrar($this->payload(['data_nascimento' => $amanha]))
             ->assertUnprocessable()
             ->assertJsonValidationErrors('data_nascimento');
     }
