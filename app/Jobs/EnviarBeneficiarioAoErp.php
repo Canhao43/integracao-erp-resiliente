@@ -43,8 +43,10 @@ class EnviarBeneficiarioAoErp implements ShouldQueue
     }
 
     /**
-     * Um envio por vez, mesmo com mais de um worker: consultar-antes-de-criar só é
-     * seguro se ninguém criar no meio. O lock expira sozinho se o worker morrer.
+     * Um envio por vez, mesmo com mais de um worker. Duas execuções do mesmo cadastro em
+     * paralelo consultariam juntas, não achariam nada e cadastrariam duas vezes. Uma trava
+     * por CPF bastaria para isso; ela é global para também não mandar escrita concorrente
+     * a um ERP que não aguenta. O lock expira sozinho se o worker morrer.
      *
      * @return array<int, object>
      */
