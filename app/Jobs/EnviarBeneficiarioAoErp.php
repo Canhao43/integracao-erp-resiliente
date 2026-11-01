@@ -64,7 +64,7 @@ class EnviarBeneficiarioAoErp implements ShouldQueue
         try {
             // O ERP não tem chave única: se uma tentativa anterior gravou e caiu antes de
             // responder, o registro já está lá. Consultar antes evita criar de novo.
-            $codigo = $erp->buscarPorCpf($this->beneficiario->cpf) ?? $erp->cadastrar($this->beneficiario);
+            $codigo = $erp->buscar($this->beneficiario) ?? $erp->cadastrar($this->beneficiario);
         } catch (ErpRecusouPedido $e) {
             $this->marcarFalha($e);
             $this->fail($e);

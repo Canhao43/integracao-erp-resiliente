@@ -4,10 +4,12 @@ namespace App\Http\Controllers;
 
 use App\Http\Requests\StoreBeneficiarioRequest;
 use App\Http\Resources\BeneficiarioResource;
+use App\Http\Resources\ChamadaErpResource;
 use App\Jobs\EnviarBeneficiarioAoErp;
 use App\Models\Beneficiario;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 use Illuminate\Validation\ValidationException;
 
 class BeneficiarioController extends Controller
@@ -33,5 +35,13 @@ class BeneficiarioController extends Controller
     public function show(Beneficiario $beneficiario): BeneficiarioResource
     {
         return BeneficiarioResource::make($beneficiario);
+    }
+
+    /**
+     * O histórico de chamadas ao ERP deste cadastro: é por aqui que o suporte vê por que não chegou.
+     */
+    public function chamadasErp(Beneficiario $beneficiario): AnonymousResourceCollection
+    {
+        return ChamadaErpResource::collection($beneficiario->chamadasErp()->orderBy('id')->get());
     }
 }

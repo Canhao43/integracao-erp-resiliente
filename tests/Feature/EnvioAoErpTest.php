@@ -5,8 +5,10 @@ namespace Tests\Feature;
 use App\Enums\StatusErp;
 use App\ErpSimulado\BeneficiarioErp;
 use App\Integracao\ClienteErp;
+use App\Integracao\ErpNaoAutenticou;
 use App\Jobs\EnviarBeneficiarioAoErp;
 use App\Models\Beneficiario;
+use App\Models\ChamadaErp;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
@@ -38,10 +40,16 @@ class EnvioAoErpTest extends TestCase
     private function erp(array $existentes = [], mixed $cadastro = null): void
     {
         Http::fake([
+            'erp.teste/token' => Http::response(['access_token' => 'token-de-teste', 'expires_in' => 3600]),
             'erp.teste/beneficiarios*' => fn (Request $request) => $request->method() === 'GET'
                 ? Http::response(['itens' => $existentes])
                 : ($cadastro ?? Http::response(['codigo' => '000042'], 201)),
         ]);
+    }
+
+    private function cadastroNoErp(Request $request): bool
+    {
+        return $request->method() === 'POST' && str_ends_with($request->url(), '/beneficiarios');
     }
 
     private function enviar(Beneficiario $beneficiario): EnviarBeneficiarioAoErp
@@ -81,7 +89,7 @@ class EnvioAoErpTest extends TestCase
         $this->assertSame(StatusErp::Enviado, $beneficiario->status_erp);
         $this->assertSame('000042', $beneficiario->codigo_erp);
         $this->assertNotNull($beneficiario->enviado_ao_erp_em);
-        Http::assertSent(fn (Request $request) => $request->method() === 'POST'
+        Http::assertSent(fn (Request $request) => $this->cadastroNoErp($request)
             && $request['cpf'] === $beneficiario->cpf
             && $request['data_nascimento'] === $beneficiario->data_nascimento->toDateString());
     }
@@ -94,7 +102,7 @@ class EnvioAoErpTest extends TestCase
         $this->enviar($beneficiario);
 
         $this->assertSame('000007', $beneficiario->refresh()->codigo_erp);
-        Http::assertNotSent(fn (Request $request) => $request->method() === 'POST');
+        Http::assertNotSent(fn (Request $request) => $this->cadastroNoErp($request));
     }
 
     public function test_erro_5xx_volta_para_a_fila_e_guarda_o_motivo(): void
@@ -115,6 +123,16 @@ class EnvioAoErpTest extends TestCase
         $beneficiario = Beneficiario::factory()->create();
 
         $this->enviarEsperandoNovaTentativa($beneficiario, ConnectionException::class);
+
+        $this->assertSame(StatusErp::Pendente, $beneficiario->refresh()->status_erp);
+    }
+
+    public function test_credencial_recusada_e_problema_de_configuracao_e_volta_para_a_fila(): void
+    {
+        Http::fake(['erp.teste/token' => Http::response(['erro' => 'Credenciais inválidas'], 401)]);
+        $beneficiario = Beneficiario::factory()->create();
+
+        $this->enviarEsperandoNovaTentativa($beneficiario, ErpNaoAutenticou::class);
 
         $this->assertSame(StatusErp::Pendente, $beneficiario->refresh()->status_erp);
     }
@@ -174,16 +192,66 @@ class EnvioAoErpTest extends TestCase
         Http::assertNothingSent();
     }
 
-    public function test_erp_que_grava_e_cai_antes_de_responder_nao_ganha_duplicata_na_nova_tentativa(): void
+    /**
+     * O job fala com o simulador de verdade, só que dentro do processo do teste.
+     */
+    private function simuladorNoProcesso(): void
     {
-        // Aqui o job fala com o simulador de verdade, só que dentro do processo do teste.
-        config(['erp.url' => 'http://erp.teste/erp-simulado', 'erp.simulador.latencia_maxima_ms' => 0, 'erp.simulador.falha' => 0]);
+        config([
+            'erp.url' => 'http://erp.teste/erp-simulado',
+            'erp.client_id' => 'integracao',
+            'erp.client_secret' => 'segredo',
+            'erp.simulador.client_id' => 'integracao',
+            'erp.simulador.client_secret' => 'segredo',
+            'erp.simulador.latencia_maxima_ms' => 0,
+            'erp.simulador.falha' => 0,
+            'erp.simulador.falha_depois_de_gravar' => 0,
+        ]);
+
         Http::fake(function (Request $request) {
             $resposta = $this->call($request->method(), $request->url(), $request->method() === 'GET' ? [] : $request->data(),
-                server: ['HTTP_ACCEPT' => 'application/json']);
+                server: ['HTTP_ACCEPT' => 'application/json', 'HTTP_AUTHORIZATION' => $request->header('Authorization')[0] ?? '']);
 
             return Http::response($resposta->getContent(), $resposta->getStatusCode());
         });
+    }
+
+    public function test_token_revogado_por_outro_login_e_renovado_sem_perder_o_envio(): void
+    {
+        $this->simuladorNoProcesso();
+        $this->enviar($primeiro = Beneficiario::factory()->create());
+
+        // Outro sistema faz login com a mesma credencial: o ERP derruba o nosso token.
+        $this->postJson('/erp-simulado/token', ['client_id' => 'integracao', 'client_secret' => 'segredo'])->assertOk();
+
+        $this->enviar($segundo = Beneficiario::factory()->create());
+
+        $this->assertSame(StatusErp::Enviado, $primeiro->refresh()->status_erp);
+        $this->assertSame(StatusErp::Enviado, $segundo->refresh()->status_erp);
+        // A auditoria conta a história: recusado, renovou, seguiu.
+        $this->assertSame(
+            ['GET /beneficiarios 401', 'POST /token 200', 'GET /beneficiarios 200', 'POST /beneficiarios 201'],
+            $this->linhaDoTempo($segundo),
+        );
+    }
+
+    /**
+     * As chamadas ao ERP desde a primeira deste beneficiário, incluindo a renovação do token.
+     *
+     * @return array<int, string>
+     */
+    private function linhaDoTempo(Beneficiario $beneficiario): array
+    {
+        $primeira = $beneficiario->chamadasErp()->min('id');
+
+        return ChamadaErp::where('id', '>=', $primeira)->orderBy('id')->get()
+            ->map(fn (ChamadaErp $c) => "{$c->metodo} {$c->caminho} {$c->status_http}")
+            ->all();
+    }
+
+    public function test_erp_que_grava_e_cai_antes_de_responder_nao_ganha_duplicata_na_nova_tentativa(): void
+    {
+        $this->simuladorNoProcesso();
         $beneficiario = Beneficiario::factory()->create();
 
         // 1ª tentativa: o ERP grava e responde 500. O cliente não sabe se deu certo.
