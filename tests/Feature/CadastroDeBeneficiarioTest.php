@@ -2,9 +2,11 @@
 
 namespace Tests\Feature;
 
+use App\Jobs\EnviarBeneficiarioAoErp;
 use App\Models\Beneficiario;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
 use Illuminate\Testing\TestResponse;
 use Tests\TestCase;
@@ -12,6 +14,14 @@ use Tests\TestCase;
 class CadastroDeBeneficiarioTest extends TestCase
 {
     use RefreshDatabase;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        // O envio ao ERP tem testes próprios; aqui só interessa a API.
+        Queue::fake();
+    }
 
     /**
      * @param  array<string, mixed>  $sobrescrever
@@ -50,6 +60,24 @@ class CadastroDeBeneficiarioTest extends TestCase
             ->assertJsonPath('data.nome', 'Maria da Silva')
             ->assertJsonPath('data.data_nascimento', '1990-05-20');
         $this->assertSame($dados['cpf'], $beneficiario->cpf);
+    }
+
+    public function test_cadastro_agenda_o_envio_ao_erp_e_responde_como_pendente(): void
+    {
+        $resposta = $this->cadastrar($this->payload());
+
+        $resposta->assertCreated()
+            ->assertJsonPath('data.erp.status', 'pendente')
+            ->assertJsonPath('data.erp.codigo', null);
+        Queue::assertPushedOn('erp', EnviarBeneficiarioAoErp::class,
+            fn (EnviarBeneficiarioAoErp $job) => $job->beneficiario->is(Beneficiario::sole()));
+    }
+
+    public function test_cadastro_recusado_nao_agenda_envio_ao_erp(): void
+    {
+        $this->cadastrar($this->payload(['cpf' => '11111111111']))->assertUnprocessable();
+
+        Queue::assertNothingPushed();
     }
 
     public function test_aceita_cpf_com_mascara_e_grava_so_os_digitos(): void

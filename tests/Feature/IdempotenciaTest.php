@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Models\ChaveIdempotencia;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
 use Illuminate\Testing\TestResponse;
 use Tests\TestCase;
@@ -11,6 +12,14 @@ use Tests\TestCase;
 class IdempotenciaTest extends TestCase
 {
     use RefreshDatabase;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        // O envio ao ERP tem testes próprios; aqui só interessa a API.
+        Queue::fake();
+    }
 
     /**
      * @param  array<string, mixed>  $sobrescrever
