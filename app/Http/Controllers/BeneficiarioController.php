@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Http\Requests\StoreBeneficiarioRequest;
 use App\Http\Resources\BeneficiarioResource;
+use App\Jobs\EnviarBeneficiarioAoErp;
 use App\Models\Beneficiario;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\JsonResponse;
@@ -19,6 +20,9 @@ class BeneficiarioController extends Controller
             // Dois pedidos com o mesmo CPF passaram juntos pela validação; o índice único barrou o segundo.
             throw ValidationException::withMessages(['cpf' => StoreBeneficiarioRequest::CPF_DUPLICADO]);
         }
+
+        // O cadastro local responde na hora; o envio ao ERP segue pela fila, no ritmo do ERP.
+        EnviarBeneficiarioAoErp::dispatch($beneficiario);
 
         return BeneficiarioResource::make($beneficiario)
             ->response()

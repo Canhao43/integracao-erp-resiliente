@@ -14,7 +14,7 @@ API em Laravel que cadastra beneficiários de plano de saúde e os envia a um ER
 |---|---|---|
 | **M1** | API de cadastro, validação de CPF, Docker e CI | ✅ |
 | **M2** | `Idempotency-Key`: o mesmo pedido reenviado não cadastra duas vezes | ✅ |
-| **M3** | ERP simulado que falha de propósito; envio em fila, um por vez, com timeout e retry | ⏳ |
+| **M3** | ERP simulado que falha de propósito; envio em fila, um por vez, com timeout e retry | ✅ |
 | **M4** | Token do ERP em cache com renovação; log de auditoria das chamadas | ⏳ |
 | **M5** | Documento de decisões consolidado | ⏳ |
 
@@ -30,7 +30,27 @@ docker compose up
 
 Na primeira subida o container instala as dependências, cria o `.env`, gera a chave e roda as migrations. A API fica em `http://localhost:8080`.
 
+Sobem cinco containers: `app` (PHP-FPM), `web` (Nginx), `db` (MySQL), `worker` (a fila de envio ao ERP) e `scheduler` (tarefas agendadas). Para ver o ERP falhando e a fila tentando de novo: `docker compose logs -f worker`.
+
 Testes: `docker compose exec app php artisan test`. Eles rodam em SQLite em memória — nunca no MySQL de desenvolvimento.
+
+## Como a integração funciona
+
+```
+cliente ──POST──▶ API ──▶ banco local (status: pendente) ──▶ 201
+                   │
+                   └──▶ fila "erp" ──▶ worker, um envio por vez
+                                         │
+                                         ├─ consulta o CPF no ERP
+                                         │    ├─ já existe → adota o código
+                                         │    └─ não existe → cadastra
+                                         │
+                                         ├─ deu certo → status: enviado + código do ERP
+                                         ├─ timeout, 5xx ou 429 → tenta de novo, com espera crescente
+                                         └─ 4xx → status: falhou (tentar de novo não muda a resposta)
+```
+
+O ERP do outro lado é **simulado** (`/erp-simulado`, só para demonstração) e não colabora de propósito: não tem chave única, demora, falha — e às vezes **grava e cai antes de responder**. A intensidade fica no `.env` (`ERP_SIMULADO_*`).
 
 ## API
 
@@ -61,14 +81,20 @@ curl -X POST http://localhost:8080/api/beneficiarios \
     "cpf": "***.456.789-**",
     "data_nascimento": "1990-05-20",
     "email": "maria@example.com",
-    "criado_em": "2026-10-31T18:00:00+00:00"
+    "criado_em": "2026-10-31T18:00:00+00:00",
+    "erp": {
+      "status": "pendente",
+      "codigo": null
+    }
   }
 }
 ```
 
+O cadastro responde na hora; o envio ao ERP acontece depois, pela fila.
+
 ### `GET /api/beneficiarios/{id}`
 
-`200` com o mesmo formato, ou `404`.
+`200` com o mesmo formato, ou `404`. É aqui que se acompanha o envio: `erp.status` passa de `pendente` para `enviado` (com o `codigo` do ERP) ou `falhou`.
 
 ## Decisões, e por quê
 
@@ -92,13 +118,22 @@ curl -X POST http://localhost:8080/api/beneficiarios \
 - **A chave vale 24 horas.** Depois sai pelo `model:prune`, agendado para rodar todo dia.
 - **CPF duplicado em pedidos simultâneos volta `422`, não `500`.** O erro do índice único vira o mesmo erro de validação de "CPF já cadastrado".
 
+### M3
+
+- **O cadastro local responde na hora; o ERP recebe pela fila.** O cliente não fica preso à lentidão nem às quedas do ERP — e acompanha o envio pelo `erp.status`.
+- **Antes de cadastrar no ERP, consulta o CPF lá.** O ERP não tem chave única, e o pior caso é ele gravar e cair antes de responder: o cliente não sabe se deu certo. Se o CPF já está lá, a integração adota o código em vez de cadastrar de novo. É a idempotência que o ERP não oferece, feita do lado de cá.
+- **Um envio por vez.** Duas execuções do mesmo cadastro em paralelo — um job que passou do tempo e foi pego por outro worker, por exemplo — consultariam juntas, não achariam nada e cadastrariam duas vezes. Uma trava por CPF já resolveria isso; a trava aqui é **global** porque ERP desse tipo também costuma não aguentar escrita concorrente (numeração sequencial, lock de tabela). Troca vazão por segurança. O worker é um só, e o job ainda usa `WithoutOverlapping`: se alguém escalar os workers, a garantia continua. O lock expira sozinho se o worker morrer.
+- **Só tenta de novo o que pode dar certo na próxima.** Timeout, `5xx` e `429` voltam para a fila com espera crescente; `4xx` é recusa do ERP e marca `falhou` na hora. O prazo total é de um dia, com até 10 falhas.
+- **O ERP simulado mora no mesmo projeto, mas é chamado por HTTP de verdade** — pelo Nginx, com timeout de verdade. Fica em `app/ErpSimulado`, separado da aplicação, e pode ser desligado (`ERP_SIMULADO_ATIVO=false`).
+- **O CI prova com o ERP falhando de propósito:** cadastra 20 beneficiários, espera a fila esvaziar e confere no MySQL que todos estão no ERP, **nenhum CPF duplicado** — e que as falhas de fato aconteceram, porque teste de resiliência sem falha não prova nada.
+
 ### O que ainda não está resolvido — de propósito
 
-- **Ainda não existe ERP do outro lado.** → M3
-- **O scheduler, que roda a limpeza das chaves, ainda não sobe no Docker.** Entra no M3, junto do worker da fila.
-- **Se o processo morrer no meio de um pedido**, a chave fica "em processamento" até vencer e o reenvio recebe `409`. A saída é considerar a reserva abandonada depois de um tempo limite.
-- **A chave é única no sistema todo, não por cliente.** Ainda não há autenticação; com ela, o escopo passa a ser por cliente. Com UUID, a chance de colisão é desprezível.
+- **Se o processo morrer no meio de um pedido**, a chave de idempotência fica "em processamento" até vencer e o reenvio recebe `409`. A saída é considerar a reserva abandonada depois de um tempo limite.
+- **A chave de idempotência é única no sistema todo, não por cliente.** Ainda não há autenticação; com ela, o escopo passa a ser por cliente. Com UUID, a chance de colisão é desprezível.
+- **O ERP ainda não exige autenticação**, e as chamadas a ele não ficam registradas. → M4
+- **"Consultar antes de criar" depende de a consulta enxergar o que acabou de ser gravado.** Num ERP com réplica atrasada, isso não vale — aí entra uma conciliação periódica.
 
 ## Stack
 
-Laravel 13 · PHP 8.4 · MySQL 8.4 · Docker Compose (php-fpm + nginx + MySQL) · PHPUnit 12 · GitHub Actions
+Laravel 13 · PHP 8.4 · MySQL 8.4 · Docker Compose (php-fpm + nginx + MySQL + worker + scheduler) · fila em banco · PHPUnit 12 · GitHub Actions
