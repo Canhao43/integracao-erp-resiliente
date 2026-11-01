@@ -15,7 +15,7 @@ API em Laravel que cadastra beneficiários de plano de saúde e os envia a um ER
 | **M1** | API de cadastro, validação de CPF, Docker e CI | ✅ |
 | **M2** | `Idempotency-Key`: o mesmo pedido reenviado não cadastra duas vezes | ✅ |
 | **M3** | ERP simulado que falha de propósito; envio em fila, um por vez, com timeout e retry | ✅ |
-| **M4** | Token do ERP em cache com renovação; log de auditoria das chamadas | ⏳ |
+| **M4** | Token do ERP em cache com renovação; log de auditoria das chamadas | ✅ |
 | **M5** | Documento de decisões consolidado | ⏳ |
 
 ## Como rodar
@@ -47,10 +47,13 @@ cliente ──POST──▶ API ──▶ banco local (status: pendente) ──�
                                          │
                                          ├─ deu certo → status: enviado + código do ERP
                                          ├─ timeout, 5xx ou 429 → tenta de novo, com espera crescente
+                                         ├─ 401 → renova o token e repete uma vez
                                          └─ 4xx → status: falhou (tentar de novo não muda a resposta)
+
+toda chamada ao ERP ──▶ auditoria (método, caminho, status, duração — sem CPF, sem token)
 ```
 
-O ERP do outro lado é **simulado** (`/erp-simulado`, só para demonstração) e não colabora de propósito: não tem chave única, demora, falha — e às vezes **grava e cai antes de responder**. A intensidade fica no `.env` (`ERP_SIMULADO_*`).
+O ERP do outro lado é **simulado** (`/erp-simulado`, só para demonstração) e não colabora de propósito: não tem chave única, demora, falha — e às vezes **grava e cai antes de responder**. Exige token, de validade curta, e **cada login novo revoga o token anterior**. A intensidade fica no `.env` (`ERP_SIMULADO_*`).
 
 ## API
 
@@ -96,6 +99,20 @@ O cadastro responde na hora; o envio ao ERP acontece depois, pela fila.
 
 `200` com o mesmo formato, ou `404`. É aqui que se acompanha o envio: `erp.status` passa de `pendente` para `enviado` (com o `codigo` do ERP) ou `falhou`.
 
+### `GET /api/beneficiarios/{id}/chamadas-erp`
+
+O histórico das chamadas ao ERP feitas para aquele cadastro, em ordem — é por aqui que o suporte vê por que um envio não chegou.
+
+```json
+{
+  "data": [
+    { "metodo": "GET",  "caminho": "/beneficiarios", "status_http": 503, "duracao_ms": 212, "erro": null, "em": "2026-10-31T18:00:01+00:00" },
+    { "metodo": "GET",  "caminho": "/beneficiarios", "status_http": 200, "duracao_ms": 87,  "erro": null, "em": "2026-10-31T18:00:03+00:00" },
+    { "metodo": "POST", "caminho": "/beneficiarios", "status_http": 201, "duracao_ms": 140, "erro": null, "em": "2026-10-31T18:00:03+00:00" }
+  ]
+}
+```
+
 ## Decisões, e por quê
 
 ### M1
@@ -127,11 +144,22 @@ O cadastro responde na hora; o envio ao ERP acontece depois, pela fila.
 - **O ERP simulado mora no mesmo projeto, mas é chamado por HTTP de verdade** — pelo Nginx, com timeout de verdade. Fica em `app/ErpSimulado`, separado da aplicação, e pode ser desligado (`ERP_SIMULADO_ATIVO=false`).
 - **O CI prova com o ERP falhando de propósito:** cadastra 20 beneficiários, espera a fila esvaziar e confere no MySQL que todos estão no ERP, **nenhum CPF duplicado** — e que as falhas de fato aconteceram, porque teste de resiliência sem falha não prova nada.
 
+### M4
+
+- **Token em cache, renovado um pouco antes de vencer.** Pedir token a cada chamada dobraria o tráfego e, num ERP que revoga o token anterior a cada login, faria cada chamada derrubar a outra. A margem (`ERP_TOKEN_MARGEM`) evita que ele vença no meio de uma chamada.
+- **A renovação passa por um lock.** Dois processos renovando juntos fariam dois logins — e o segundo revogaria o token do primeiro. Quem chega depois espera e usa o token que o outro acabou de pegar.
+- **Um token por ERP e por credencial.** A chave do cache inclui a URL do ERP: homologação e produção nunca dividem token.
+- **`401` → renova e repete uma vez.** O token pode ter sido revogado por outro login antes da hora. Se a recusa continua depois de renovar, é credencial errada.
+- **Credencial errada não marca o cadastro como `falhou`.** É problema de configuração da integração, não do dado: o envio fica `pendente` e a fila tenta de novo. Marcar como falhou espalharia o erro por todos os cadastros até alguém arrumar a configuração.
+- **Auditoria só com metadados:** método, caminho, status, duração e erro de conexão. **Sem corpo, sem query string, sem token** — o CPF e a credencial não vão parar no log (minimização, LGPD). Para saber de quem é a chamada, basta o `beneficiario_id`.
+- **A auditoria não se altera:** o model recusa `update` e `delete`. Sai só pela retenção (`ERP_AUDITORIA_RETENCAO_DIAS`, 90 dias), em lote, pelo `model:prune` agendado.
+- **O CI força uma renovação de verdade:** espera o token vencer, cadastra mais um e confere na auditoria que o token foi renovado, que nenhuma chamada levou `401` e que nenhuma linha tem CPF.
+
 ### O que ainda não está resolvido — de propósito
 
+- **A API não tem autenticação.** Por isso a chave de idempotência é única no sistema todo (com autenticação, seria por cliente) e o histórico de chamadas ao ERP fica aberto — num ambiente real, ele seria rota interna, com permissão de suporte.
 - **Se o processo morrer no meio de um pedido**, a chave de idempotência fica "em processamento" até vencer e o reenvio recebe `409`. A saída é considerar a reserva abandonada depois de um tempo limite.
-- **A chave de idempotência é única no sistema todo, não por cliente.** Ainda não há autenticação; com ela, o escopo passa a ser por cliente. Com UUID, a chance de colisão é desprezível.
-- **O ERP ainda não exige autenticação**, e as chamadas a ele não ficam registradas. → M4
+- **A imutabilidade da auditoria é garantida pela aplicação, não pelo banco.** Um `UPDATE` direto no MySQL passa. O próximo passo seria um usuário de banco só com `INSERT` nessa tabela.
 - **"Consultar antes de criar" depende de a consulta enxergar o que acabou de ser gravado.** Num ERP com réplica atrasada, isso não vale — aí entra uma conciliação periódica.
 
 ## Stack

@@ -105,6 +105,34 @@ jobs:
           test "$duplicados" = "0"
           test "$falhas" -gt 0
 
+      - name: Espera o token vencer e cadastra mais um
+        run: |
+          sleep 21
+          cpf=$(docker compose exec -T app php -r 'require "vendor/autoload.php"; echo Faker\Factory::create("pt_BR")->cpf(false);')
+          id=$(curl -s -X POST http://localhost:8080/api/beneficiarios \
+            -H 'Accept: application/json' -H 'Content-Type: application/json' \
+            -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" \
+            -d "{\"nome\":\"Depois do token vencer\",\"cpf\":\"$cpf\",\"data_nascimento\":\"1990-01-01\"}" | grep -o '"id":[0-9]*' | cut -d: -f2)
+          for i in $(seq 1 30); do
+            status=$(curl -s "http://localhost:8080/api/beneficiarios/$id" | grep -o '"status":"[a-z]*"' | cut -d'"' -f4)
+            if [ "$status" = "enviado" ]; then echo "Enviado depois de o token vencer"; exit 0; fi
+            sleep 2
+          done
+          echo "Status final: $status"
+          exit 1
+
+      - name: Confere a auditoria — token renovado antes de vencer e nenhum CPF registrado
+        run: |
+          q() { docker compose exec -T db mysql -uapp -papp -N erp_resiliente -e "$1" 2>/dev/null; }
+          chamadas=$(q "SELECT COUNT(*) FROM chamadas_erp")
+          tokens=$(q "SELECT COUNT(*) FROM chamadas_erp WHERE caminho = '/token' AND status_http = 200")
+          recusas=$(q "SELECT COUNT(*) FROM chamadas_erp WHERE status_http = 401")
+          com_cpf=$(q "SELECT COUNT(*) FROM chamadas_erp c JOIN beneficiarios b ON INSTR(CONCAT_WS('|', c.caminho, IFNULL(c.erro, '')), b.cpf) > 0")
+          echo "Chamadas auditadas: $chamadas | tokens emitidos: $tokens | recusas 401: $recusas | linhas com CPF: $com_cpf"
+          test "$tokens" -ge 2
+          test "$recusas" = "0"
+          test "$com_cpf" = "0"
+
       - name: Testes dentro do container
         run: docker compose exec -T app php artisan test
 
