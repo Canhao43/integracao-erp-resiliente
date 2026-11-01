@@ -107,6 +107,11 @@ jobs:
 
       - name: Espera o token vencer e cadastra mais um
         run: |
+          # A resistência a falhas já foi provada no lote acima. Aqui se mede só a renovação do
+          # token: com falhas aleatórias ligadas, a espera entre tentativas estoura o prazo da etapa.
+          docker compose exec -T app sed -i \
+            -e 's/^ERP_SIMULADO_FALHA=.*/ERP_SIMULADO_FALHA=0/' \
+            -e 's/^ERP_SIMULADO_FALHA_DEPOIS_DE_GRAVAR=.*/ERP_SIMULADO_FALHA_DEPOIS_DE_GRAVAR=0/' .env
           sleep 21
           cpf=$(docker compose exec -T app php -r 'require "vendor/autoload.php"; echo Faker\Factory::create("pt_BR")->cpf(false);')
           id=$(curl -s -X POST http://localhost:8080/api/beneficiarios \
