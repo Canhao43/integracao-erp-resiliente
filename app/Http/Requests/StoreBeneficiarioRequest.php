@@ -8,6 +8,8 @@ use Illuminate\Validation\Rule;
 
 class StoreBeneficiarioRequest extends FormRequest
 {
+    public const CPF_DUPLICADO = 'Já existe um beneficiário com este CPF.';
+
     /**
      * Aceita o CPF com ou sem máscara, mas valida e grava só os dígitos —
      * senão "123.456.789-09" e "12345678909" virariam dois cadastros.
@@ -41,7 +43,7 @@ class StoreBeneficiarioRequest extends FormRequest
             'required' => 'O campo :attribute é obrigatório.',
             'string' => 'O campo :attribute deve ser texto.',
             'max' => 'O campo :attribute deve ter no máximo :max caracteres.',
-            'cpf.unique' => 'Já existe um beneficiário com este CPF.',
+            'cpf.unique' => self::CPF_DUPLICADO,
             'data_nascimento.date_format' => 'A data de nascimento deve estar no formato AAAA-MM-DD.',
             'data_nascimento.before' => 'A data de nascimento deve ser anterior a hoje.',
             'email.email' => 'O e-mail informado não é válido.',
