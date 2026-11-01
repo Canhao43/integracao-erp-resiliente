@@ -50,12 +50,23 @@ jobs:
       - name: Cadastra um beneficiário pela API
         run: |
           CPF=$(docker compose exec -T app php -r 'require "vendor/autoload.php"; echo Faker\Factory::create("pt_BR")->cpf(false);')
+          CHAVE=$(cat /proc/sys/kernel/random/uuid)
           echo "CPF=$CPF" >> "$GITHUB_ENV"
+          echo "CHAVE=$CHAVE" >> "$GITHUB_ENV"
           status=$(curl -s -o resposta.json -w '%{http_code}' -X POST http://localhost:8080/api/beneficiarios \
-            -H 'Accept: application/json' -H 'Content-Type: application/json' \
+            -H 'Accept: application/json' -H 'Content-Type: application/json' -H "Idempotency-Key: $CHAVE" \
             -d "{\"nome\":\"Teste do CI\",\"cpf\":\"$CPF\",\"data_nascimento\":\"1990-01-01\"}")
           cat resposta.json; echo
           test "$status" = "201"
+
+      - name: Reenvia o mesmo pedido com a mesma chave
+        run: |
+          status=$(curl -s -D cabecalhos.txt -o reenvio.json -w '%{http_code}' -X POST http://localhost:8080/api/beneficiarios \
+            -H 'Accept: application/json' -H 'Content-Type: application/json' -H "Idempotency-Key: $CHAVE" \
+            -d "{\"nome\":\"Teste do CI\",\"cpf\":\"$CPF\",\"data_nascimento\":\"1990-01-01\"}")
+          test "$status" = "201"
+          grep -qi '^Idempotent-Replayed: true' cabecalhos.txt
+          cmp resposta.json reenvio.json && echo "Reenvio devolveu a resposta original, byte a byte"
 
       - name: Testes dentro do container
         run: docker compose exec -T app php artisan test

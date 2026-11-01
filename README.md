@@ -13,7 +13,7 @@ API em Laravel que cadastra beneficiários de plano de saúde e os envia a um ER
 | Marco | O que entra | Estado |
 |---|---|---|
 | **M1** | API de cadastro, validação de CPF, Docker e CI | ✅ |
-| **M2** | `Idempotency-Key`: o mesmo pedido reenviado não cadastra duas vezes | ⏳ |
+| **M2** | `Idempotency-Key`: o mesmo pedido reenviado não cadastra duas vezes | ✅ |
 | **M3** | ERP simulado que falha de propósito; envio em fila, um por vez, com timeout e retry | ⏳ |
 | **M4** | Token do ERP em cache com renovação; log de auditoria das chamadas | ⏳ |
 | **M5** | Documento de decisões consolidado | ⏳ |
@@ -36,16 +36,22 @@ Testes: `docker compose exec app php artisan test`. Eles rodam em SQLite em mem�
 
 ### `POST /api/beneficiarios`
 
+Exige o header `Idempotency-Key` — um identificador único do pedido, gerado pelo cliente (um UUID, por exemplo). Reenviar com a mesma chave não cadastra de novo.
+
 ```bash
 curl -X POST http://localhost:8080/api/beneficiarios \
   -H 'Accept: application/json' -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" \
   -d '{"nome": "Maria da Silva", "cpf": "<CPF válido>", "data_nascimento": "1990-05-20", "email": "maria@example.com"}'
 ```
 
 | Resposta | Quando |
 |---|---|
 | `201` + header `Location` | cadastrou |
-| `422` | campo obrigatório ausente, CPF inválido ou já cadastrado, data de nascimento no futuro |
+| `201` + `Idempotent-Replayed: true` | reenvio de um pedido já concluído: devolve a resposta original, sem cadastrar de novo |
+| `400` | sem `Idempotency-Key` |
+| `409` | um pedido com a mesma chave ainda está em processamento |
+| `422` | campo obrigatório ausente, CPF inválido ou já cadastrado, data de nascimento no futuro — ou chave já usada com outro conteúdo |
 
 ```json
 {
@@ -76,11 +82,22 @@ curl -X POST http://localhost:8080/api/beneficiarios \
 - **PHPUnit, não Pest.** É o padrão do Laravel 13 e o que eu uso no trabalho.
 - **CI em dois jobs.** Um roda testes e estilo. O outro sobe a stack Docker de verdade, cadastra pela API, roda os testes dentro do container e **lê de volta no MySQL** que o cadastro existe — e que os testes não tocaram nele. Medição, em vez de "deveria funcionar".
 
+### M2
+
+- **Segue o [draft da IETF](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/) para `Idempotency-Key`:** `400` sem a chave, `422` para chave reusada com outro conteúdo, `409` enquanto o primeiro pedido ainda processa. Muita API usa `428` para a chave ausente; aqui ficou o que o draft recomenda.
+- **A reserva da chave é gravada antes de executar, fora de transação, com índice único.** É isso que faz o segundo pedido simultâneo enxergar o primeiro em andamento e receber `409`, em vez de cadastrar junto.
+- **Guarda a resposta, não só a chave.** No reenvio o cliente recebe exatamente o que teria recebido — mesmo corpo, mesmo `Location` — mais o header `Idempotent-Replayed: true`. O draft não define header de resposta; o nome é a convenção do Stripe.
+- **Só sucesso fica guardado.** Erro de validação libera a chave: o cliente corrige o pedido e reenvia com a mesma chave.
+- **Mesmo pedido = mesmo método, caminho e corpo, com os campos do JSON ordenados**, comparados por hash SHA-256. A ordem dos campos não faz dois pedidos iguais parecerem diferentes.
+- **A chave vale 24 horas.** Depois sai pelo `model:prune`, agendado para rodar todo dia.
+- **CPF duplicado em pedidos simultâneos volta `422`, não `500`.** O erro do índice único vira o mesmo erro de validação de "CPF já cadastrado".
+
 ### O que ainda não está resolvido — de propósito
 
-- **Pedido reenviado** (o cliente deu timeout e tentou de novo) volta `422 CPF já cadastrado`. O cliente não sabe se o primeiro deu certo. → M2
-- **Dois pedidos simultâneos com o mesmo CPF:** o segundo esbarra no índice único e hoje vira erro `500`. → M2
 - **Ainda não existe ERP do outro lado.** → M3
+- **O scheduler, que roda a limpeza das chaves, ainda não sobe no Docker.** Entra no M3, junto do worker da fila.
+- **Se o processo morrer no meio de um pedido**, a chave fica "em processamento" até vencer e o reenvio recebe `409`. A saída é considerar a reserva abandonada depois de um tempo limite.
+- **A chave é única no sistema todo, não por cliente.** Ainda não há autenticação; com ela, o escopo passa a ser por cliente. Com UUID, a chance de colisão é desprezível.
 
 ## Stack
 
