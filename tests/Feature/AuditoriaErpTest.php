@@ -49,7 +49,7 @@ class AuditoriaErpTest extends TestCase
             $chamadas->map(fn (ChamadaErp $c) => "{$c->metodo} {$c->caminho} {$c->status_http}")->all(),
         );
         $this->assertSame([null, $beneficiario->id, $beneficiario->id], $chamadas->pluck('beneficiario_id')->all());
-        $this->assertContainsOnly('int', $chamadas->pluck('duracao_ms')->all());
+        $this->assertContainsOnlyInt($chamadas->pluck('duracao_ms')->all());
     }
 
     public function test_falha_de_conexao_fica_registrada_sem_status(): void
