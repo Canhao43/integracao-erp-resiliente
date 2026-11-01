@@ -68,6 +68,43 @@ jobs:
           grep -qi '^Idempotent-Replayed: true' cabecalhos.txt
           cmp resposta.json reenvio.json && echo "Reenvio devolveu a resposta original, byte a byte"
 
+      - name: Cadastra mais 20 com o ERP falhando de propósito
+        run: |
+          cpfs=$(docker compose exec -T app php -r 'require "vendor/autoload.php"; $f = Faker\Factory::create("pt_BR"); for ($i = 0; $i < 20; $i++) echo $f->unique()->cpf(false), " ";')
+          i=0
+          for cpf in $cpfs; do
+            i=$((i + 1))
+            status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/api/beneficiarios \
+              -H 'Accept: application/json' -H 'Content-Type: application/json' \
+              -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" \
+              -d "{\"nome\":\"Lote do CI $i\",\"cpf\":\"$cpf\",\"data_nascimento\":\"1990-01-01\"}")
+            test "$status" = "201"
+          done
+
+      - name: Espera a fila do ERP esvaziar
+        run: |
+          for i in $(seq 1 90); do
+            pendentes=$(docker compose exec -T db mysql -uapp -papp -N erp_resiliente -e "SELECT COUNT(*) FROM beneficiarios WHERE status_erp <> 'enviado'" 2>/dev/null)
+            if [ "$pendentes" = "0" ]; then echo "Fila vazia em ~$((i * 2))s"; exit 0; fi
+            sleep 2
+          done
+          echo "Ainda há $pendentes beneficiários fora do ERP"
+          exit 1
+
+      - name: Confere no ERP — todos lá, nenhum duplicado, e as falhas aconteceram
+        run: |
+          q() { docker compose exec -T db mysql -uapp -papp -N erp_resiliente -e "$1" 2>/dev/null; }
+          locais=$(q "SELECT COUNT(*) FROM beneficiarios")
+          no_erp=$(q "SELECT COUNT(DISTINCT cpf) FROM erp_simulado_beneficiarios")
+          duplicados=$(q "SELECT COUNT(*) FROM (SELECT cpf FROM erp_simulado_beneficiarios GROUP BY cpf HAVING COUNT(*) > 1) d")
+          falhas=$(grep -c 'falha injetada' storage/logs/laravel.log || true)
+          depois_de_gravar=$(grep -c 'falha injetada depois de gravar' storage/logs/laravel.log || true)
+          echo "Beneficiários: $locais | CPFs no ERP: $no_erp | CPFs duplicados no ERP: $duplicados"
+          echo "Falhas injetadas pelo ERP: $falhas (depois de gravar: $depois_de_gravar)"
+          test "$locais" = "$no_erp"
+          test "$duplicados" = "0"
+          test "$falhas" -gt 0
+
       - name: Testes dentro do container
         run: docker compose exec -T app php artisan test
 
