@@ -1,12 +1,38 @@
+# Base comum dos três containers PHP (app, worker e scheduler): mesma imagem, mesmo código.
+x-php: &php
+  build: docker/php
+  volumes:
+    - .:/var/www/html
+  # Sem "environment:" de propósito: a conexão com o banco vem do .env
+  # (ver o comentário no .env.example).
+
 services:
   app:
-    build: docker/php
-    volumes:
-      - .:/var/www/html
-    # Sem "environment:" de propósito: a conexão com o banco vem do .env
-    # (ver o comentário no .env.example).
+    <<: *php
     depends_on:
       db:
+        condition: service_healthy
+    # Pronto = o entrypoint terminou de instalar dependências e rodar as migrations.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/pronto"]
+      interval: 3s
+      timeout: 2s
+      retries: 100
+
+  # Processa a fila "erp" — um envio por vez (ver EnviarBeneficiarioAoErp::middleware).
+  worker:
+    <<: *php
+    command: php artisan queue:work --queue=erp,default --sleep=1
+    depends_on:
+      app:
+        condition: service_healthy
+
+  # Tarefas agendadas, como a limpeza das chaves de idempotência vencidas.
+  scheduler:
+    <<: *php
+    command: php artisan schedule:work
+    depends_on:
+      app:
         condition: service_healthy
 
   web:

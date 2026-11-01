@@ -13,4 +13,7 @@ chmod -R ugo+rwX storage bootstrap/cache 2>/dev/null || true
 
 php artisan migrate --force
 
+# Sinal para o healthcheck: o worker e o scheduler só sobem depois disto.
+touch /tmp/pronto
+
 exec "$@"
