@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  testes:
+    name: Testes e estilo (PHP 8.4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+
+      - name: Dependências
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Ambiente
+        run: cp .env.example .env && php artisan key:generate
+
+      - name: Estilo (Pint)
+        run: vendor/bin/pint --test
+
+      - name: Testes
+        run: php artisan test
+
+  docker:
+    name: Stack Docker com MySQL de verdade
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Sobe a stack
+        run: docker compose up -d --build
+
+      - name: Espera a aplicação responder
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8080/up > /dev/null && exit 0
+            sleep 3
+          done
+          echo "A aplicação não respondeu em 3 minutos"
+          exit 1
+
+      - name: Cadastra um beneficiário pela API
+        run: |
+          CPF=$(docker compose exec -T app php -r 'require "vendor/autoload.php"; echo Faker\Factory::create("pt_BR")->cpf(false);')
+          echo "CPF=$CPF" >> "$GITHUB_ENV"
+          status=$(curl -s -o resposta.json -w '%{http_code}' -X POST http://localhost:8080/api/beneficiarios \
+            -H 'Accept: application/json' -H 'Content-Type: application/json' \
+            -d "{\"nome\":\"Teste do CI\",\"cpf\":\"$CPF\",\"data_nascimento\":\"1990-01-01\"}")
+          cat resposta.json; echo
+          test "$status" = "201"
+
+      - name: Testes dentro do container
+        run: docker compose exec -T app php artisan test
+
+      - name: Confere no MySQL — o cadastro existe e os testes não tocaram nele
+        run: |
+          total=$(docker compose exec -T db mysql -uapp -papp -N -e "SELECT COUNT(*) FROM erp_resiliente.beneficiarios WHERE cpf = '$CPF'" 2>/dev/null)
+          echo "Registros com o CPF cadastrado pela API: $total"
+          test "$total" = "1"
+
+      - name: Logs da stack
+        if: failure()
+        run: docker compose logs
